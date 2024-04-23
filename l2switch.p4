@@ -16,6 +16,12 @@ const bit<16> TYPE_ARP          = 0x0806;
 const bit<16> TYPE_CPU_METADATA = 0x080a;
 const bit<16> TYPE_IPV4         = 0x800;
 
+const bit<8> PWOSPF_VER         = 0x2;
+const bit<8> HELLO_TYPE         = 0x1;
+const bit<8> LSU_TYPE           = 0x4;
+const bit<8> PWOSPF_PROT        = 0x59;
+
+const bit<32> ALLSPFRouters = 0xe0000005;
 
 header ethernet_t {
     macAddr_t dstAddr;
@@ -42,6 +48,33 @@ header arp_t {
     ip4Addr_t dstIP;
 }
 
+header pwospf_hdr_t {
+    bit<8> version;
+    bit<8> type;
+    bit<16> length;
+    bit<32> routerID;
+    bit<32> areaID;
+    bit<16> checksum;
+    bit<16> authType;
+    bit<64> auth;
+}
+
+header pwospf_hello_hdr_t {
+    bit<16> helloInt;
+    bit<32> mask;
+    bit<16> options;
+}
+
+header lsu_hdr_t {
+    bit<16> seqNum;
+    bit<16> ttl;
+    bit<32> adverts;
+}
+
+header lsu_advert_t {
+    varbit<960> content;
+}
+
 header ipv4_t {
     bit<4>    version;
     bit<4>    ihl;
@@ -58,12 +91,17 @@ header ipv4_t {
 }
 
 struct headers {
-    ethernet_t        ethernet;
-    cpu_metadata_t    cpu_metadata;
-    arp_t             arp;
-    ipv4_t            ipv4;
+    ethernet_t           ethernet;
+    cpu_metadata_t       cpu_metadata;
+    arp_t                arp;
+    ipv4_t               ipv4;
+    pwospf_hdr_t         pwospf_hdr;
+    pwospf_hello_hdr_t   pwospf_hello_hdr;
+    lsu_hdr_t            lsu_hdr;
+    lsu_advert_t      lsu_advert;
 }
 
+error {Invalid_PWOSPF}
 struct metadata { }
 
 parser MyParser(packet_in packet,
@@ -96,13 +134,41 @@ parser MyParser(packet_in packet,
 
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
-        transition accept;
+        transition select(hdr.ipv4.protocol){
+            PWOSPF_PROT: parse_pwospf_hdr;
+            default: accept;
+        }
     }
 
     state parse_arp {
         packet.extract(hdr.arp);
         transition accept;
     }
+
+    state parse_pwospf_hdr{
+        packet.extract(hdr.pwospf_hdr);
+        transition select(hdr.pwospf_hdr.type){
+            HELLO_TYPE: parse_pwospf_hello_hdr;
+            LSU_TYPE: parse_lsu_hdr;
+            default: accept;
+        }
+    }
+
+    state parse_pwospf_hello_hdr{
+        packet.extract(hdr.pwospf_hello_hdr);
+        transition accept;
+   }
+
+   state parse_lsu_hdr{
+        packet.extract(hdr.lsu_hdr);
+        verify(hdr.lsu_hdr.adverts >= 1, error.Invalid_PWOSPF);
+        transition parse_lsu_advert;
+   }
+
+   state parse_lsu_advert{
+    packet.extract(hdr.lsu_advert,(bit<32>)(hdr.lsu_hdr.adverts * 32));
+    transition accept;
+   }
 }
 
 control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
@@ -148,6 +214,13 @@ control MyIngress(inout headers hdr,
     action send_to_cpu() {
         cpu_meta_encap();
         standard_metadata.egress_spec = CPU_PORT;
+    }
+
+    action ipv4_forward(macAddr_t dstAddr, port_t port){
+        standard_metadata.egress_spec = port;
+        hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
+        hdr.ethernet.dstAddr = dstAddr;
+        hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
 
     action arp_match(macAddr_t dst_mac_addr) {
@@ -196,6 +269,7 @@ control MyIngress(inout headers hdr,
             set_mgid;
             drop;
             NoAction;
+            send_to_cpu;
         }
         size = 1024;
         default_action = drop();
@@ -206,11 +280,20 @@ control MyIngress(inout headers hdr,
 
         if (standard_metadata.ingress_port == CPU_PORT)
             cpu_meta_decap();
-            count_cpu_packets.count((bit<32>) 0);
 
-        if (hdr.ipv4.isValid()) {
-            log_msg("Valid IP");
-            count_ip_packets.count((bit<32>) 0);
+        if(hdr.pwospf_hello_hdr.isValid()){
+            if(standard_metadata.ingress_port == CPU_PORT){
+                fwd_l2.apply();
+            }
+            else{
+                send_to_cpu();
+            }
+        }
+        else if(hdr.lsu_hdr.isValid() && standard_metadata.ingress_port != CPU_PORT){
+            send_to_cpu();
+        }
+
+        else if (hdr.ipv4.isValid()) {
 
             if (routing_table.apply().hit) {
                 if (arp_table.apply().hit) {
@@ -220,10 +303,7 @@ control MyIngress(inout headers hdr,
         }
 
         else if (hdr.arp.isValid() && standard_metadata.ingress_port != CPU_PORT) {
-            log_msg("Valid ARP");
-            count_arp_packets.count((bit<32>) 0);
             send_to_cpu();
-            count_cpu_packets.count((bit<32>) 0);
         }
         else if (hdr.ethernet.isValid()) {
             fwd_l2.apply();
@@ -248,6 +328,10 @@ control MyDeparser(packet_out packet, in headers hdr) {
         packet.emit(hdr.cpu_metadata);
         packet.emit(hdr.arp);
         packet.emit(hdr.ipv4);
+        packet.emit(hdr.pwospf_hdr);
+        packet.emit(hdr.pwospf_hello_hdr);
+        packet.emit(hdr.lsu_hdr);
+        packet.emit(hdr.lsu_advert);
     }
 }
 
