@@ -1,6 +1,3 @@
-from mininet.topo import Topo
-
-
 class SwitchTopo(Topo):
     def __init__(self, **opts):
         Topo.__init__(self, **opts)
@@ -8,8 +5,9 @@ class SwitchTopo(Topo):
         s1 = self.addSwitch("s1")
         s2 = self.addSwitch("s2")
         s3 = self.addSwitch("s3")
+        s4 = self.addSwitch("s4")
 
-        switches = [s1,s2,s3]
+        switches = [s1,s2,s3,s4]
 
         for num, switch in enumerate(switches):
 
@@ -35,3 +33,5 @@ class SwitchTopo(Topo):
         self.addLink(s1, s2)
         self.addLink(s2, s3)
         self.addLink(s3, s1)
+        self.addLink(s3, s4)
+        self.addLink(s4, s2)

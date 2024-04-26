@@ -19,119 +19,136 @@ TTL_DEFAULT = 0x1e
 ALLSPFRouters = "224.0.0.5"
 
 class Routes():
-    def __init__(self, sw, routerID, areaID, subnet_masks, intfs_ips, intfs_ospf):
+    def __init__(self,sw,routerID,areadID,subnet_masks,intfs_ips, intfs_ospf):
         self.sw = sw
         self.routerID = routerID
-        self.areaID = areaID
-        self.subnet_masks = subnet_masks
-        self.ips = intfs_ips
+        self.areadID = areadID
+
         self.ospf_intfs = intfs_ospf
+        self.ips = intfs_ips #Your own interface IPs
+        self.id_to_ip = {} #Tracks the interface for the RID.
+        self.subnet_masks = subnet_masks #These are the subnets that I own
+        self.adj = {routerID: []} #Maps RID --> list of RID. updated on Hello Packet
+        self.lsa = {routerID: self.subnet_masks} #Maps RID --> (subnet,mask) updated on LSU. If the subnet is on your own put a mask of /32
+        self.routes = {} #Maps Subnet+Mask --> Next Hop IP. Keep track of state of Dataplane table
+        self.seq_num = {} #Maps Adjacent Host(RID) --> Sequence number of LSU
 
-        self.id_to_ip = {}
 
-        self.adj = {routerID: []}
-        self.lsa = {routerID: self.subnet_masks}
-        self.routes = {}
-        self.seqNum = {}
-
-
-    def check_seq(self, pkt):
-        router_id = pkt[PWOSPF].routerID
-        if pkt[PWOSPF].seqNum <= self.seqNum.get(router_id, 0):
+    def check_seq(self,pkt):
+        rid = pkt[PWOSPF].routerID
+        if rid not in self.seq_num.keys():
+            self.seq_num[rid] = pkt[PWOSPF].seqNum
+            return False
+        if pkt[PWOSPF].seqNum <= self.seq_num[rid]:
             return True
-        self.seqNum[router_id] = pkt[PWOSPF].seqNum
+        self.seq_num[rid] = pkt[PWOSPF].seqNum
         return False
 
-
-    def update_lsu(self, pkt):
-        router_id = pkt[PWOSPF].routerID
-        router_ip = pkt[IP].src
-
+    #TODO: if change is detected in LSU, send LSU flood?
+    def update_lsu(self,pkt):
+        rid = pkt[PWOSPF].routerID
+        rip = pkt[IP].src
         if self.check_seq(pkt):
-            return False
-
-        valid = any(router_id in intf.neighbor_ids and router_ip in intf.neighbor_ips for intf in self.ospf_intfs)
-        if not valid:
-            return False
-
+            return
+        #Check Link Status for this neighbor, has to be one of the interfaces
+        valid = False
         change = False
-        lsu_ads = pkt[PWOSPF].advertisements
-        for lsu_ad in lsu_ads:
-            lsu_rid = lsu_ad.routerID
-
-            if lsu_rid not in self.lsa:
-                continue
-
-            subnet = lsu_ad.subnet
-            mask = lsu_ad.mask
-            if (subnet, mask) not in self.lsa[lsu_rid]:
-                self.lsa[lsu_rid].append((subnet, mask))
-                change = True
-
-            path = self.next_hop(subnet, mask)
-            if len(path) > 1:
-                next_hop_ip = self.id_to_ip[path[1]]
-                route_key = (subnet, 0xFFFFFF00)
-
-                if route_key in self.routes:
-                    self.edit_route(next_hop_ip, subnet, mask)
-                else:
-                    self.add_route(next_hop_ip, subnet, mask)
-                self.routes[route_key] = next_hop_ip
-
+        #Has to be a trusted interface
+        for i in self.ospf_intfs:
+            if rid in i.neighbor_ids and rip in i.neighbor_ips:
+                valid = True
+                break
+        if valid:
+            lsu_ads = pkt[PWOSPF].advertisements
+            lsu_ad = pkt[PWOSPF].advertisements[0]
+            lsu_num = pkt[PWOSPF].adverts
+            print(f"{self.sw} --> PRIOR: {self.lsa}")
+            for i in range(0,lsu_num):
+                lsu_rid = lsu_ad.routerID
+                if lsu_rid not in self.lsa:
+                    #Also add to Adjacency graph of neighbor
+                    if lsu_rid not in self.adj[pkt[PWOSPF].routerID]:
+                        self.adj[pkt[PWOSPF].routerID].append(lsu_rid)
+                        if lsu_rid not in self.adj:
+                            self.adj[lsu_rid] = []
+                        self.adj[lsu_rid].append(pkt[PWOSPF].routerID)
+                        print(f"{self.sw} --> EDGE {self.adj}")
+                    self.lsa[lsu_rid] = []
+                subnet = lsu_ad.subnet
+                mask = lsu_ad.mask
+                if (subnet,mask) not in self.lsa[lsu_rid]:
+                    print(f"{self.sw} --> ADDING {subnet}/{mask}/{lsu_rid}")
+                    self.lsa[lsu_ad.routerID].append((subnet,mask))
+                    change = True
+                path = self.next_hop(subnet,mask)
+                #print(f"{self.sw} --> {path} to {subnet}/{mask}")
+                if len(path) > 1:
+                    next_hop =self.id_to_ip[path[1]]
+                    mask = 0xFFFFFF00
+                    key = (subnet,mask)
+                    if key in self.routes:
+                        self.edit_route(next_hop,subnet,mask)
+                    else:
+                        self.add_route(next_hop,subnet,mask)
+                    self.routes[key] = next_hop
+                lsu_ad = lsu_ad.payload
+        #Debug Prints
+        if change:
+            print(f"{self.sw}:ADJ {self.adj}\n")
+            print(f"{self.sw}:LSA {self.lsa}\n")
+            print(f"{self.sw}:ROUTES {self.routes}\n")
         return change
 
-    def add_adj(self, router_id):
-        if router_id not in self.adj.keys():
-            self.adj[router_id] = []
-        if router_id not in self.adj[self.routerID]:
-            self.adj[self.routerID].append(router_id)
-        if self.routerID not in self.adj[router_id]:
-            self.adj[router_id].append(self.routerID)
-
-    def del_adj(self, router_id):
-        for i in self.adj[router_id]:
+    #Add as neighboring node
+    def add_adj(self,rid):
+        if rid not in self.adj.keys():
+            self.adj[rid] = []
+        if rid not in self.adj[self.routerID]:
+            self.adj[self.routerID].append(rid)
+        if self.routerID not in self.adj[rid]:
+            self.adj[rid].append(self.routerID)
+    def del_adj(self,rid):
+        for i in self.adj[rid]:
             if i in self.adj.keys():
-                self.adj[i].remove(router_id)
-        del self.adj[router_id]
+                self.adj[i].remove(rid)
+        del self.adj[rid]
 
-    def edit_route(self, ip, subnet, mask):
-        self.del_route(ip, subnet, mask)
-        self.add_route(ip, subnet, mask)
+    def edit_route(self,ip,subnet,mask):
+        self.del_route(ip,subnet,mask)
+        self.add_route(ip,subnet,mask)
 
-    def add_route(self, ip, subnet, mask):
+    def add_route(self,ip,subnet,mask):
         priority = 1 if mask == 0xFFFFFF00 else 2
-
+        #print(f"{self.sw}: {subnet},{mask} --> {ip}")
         self.sw.insertTableEntry(
             table_name="MyIngress.routing_table",
-            match_fields={"hdr.ipv4.dstAddr": [subnet, mask]},
+            match_fields={"hdr.ipv4.dstAddr": [subnet,mask]},
             action_name="MyIngress.set_next_hop",
-            action_params={"next_hop": ip},
+            action_params={"next_hop":ip},
             priority = priority,
         )
-
-    def del_route(self, ip, subnet, mask):
+    def del_route(self,ip,subnet,mask):
         priority = 1 if mask == 0xFFFFFF00 else 2
-
+        #print(f"del {self.sw}: {subnet},{mask} --> {ip}")
         self.sw.removeTableEntry(
             table_name="MyIngress.routing_table",
-            match_fields={"hdr.ipv4.dstAddr": [subnet, mask]},
+            match_fields={"hdr.ipv4.dstAddr": [subnet,mask]},
             action_name="MyIngress.set_next_hop",
-            action_params={"next_hop": ip},
+            action_params={"next_hop":ip},
             priority = priority,
         )
 
-    def find_node(self, router_id, ip):
-        self.id_to_ip[router_id] = ip
-        self.add_adj(router_id)
-        self.lsa[router_id] = []
+    def find_node(self,rid,ip):
+        self.id_to_ip[rid] = ip
+        self.add_adj(rid)
+        self.lsa[rid] = []
         mask = 0xFFFFFFFF
         if (ip,mask) not in self.routes.keys():
             self.routes[(ip,mask)] = ip
             subnet = str(ip_network(int(ip_address(ip)) & mask).network_address)
-            self.add_route(ip, subnet, mask)
+            self.add_route(ip,subnet,mask)
 
-    def next_hop(self, subnet, mask):
+    def next_hop(self,subnet,mask):
         visited = set()
         queue = [(self.routerID, [self.routerID])]
 
@@ -147,6 +164,7 @@ class Routes():
                 for neighbor in self.adj[current]:
                     if neighbor not in visited:
                         queue.append((neighbor, path + [neighbor]))
+
 
 
 class ArpCache:
@@ -263,7 +281,7 @@ class Controller(Thread):
             self.ospf_intfs.append(intfs)
             self.ospfHelloCallback(HELLO_INT, intfs, i)
 
-        self.lsu_timer = threading.Timer(3*lsuInt, self.floodLSUPkt)
+        self.lsu_timer = threading.Timer(3*lsuInt, self.pwospf_lsu_flood_wrapper)
         self.lsu_timer.start()
         self.routes = Routes(sw, routerID, areaID, subnet_masks, ips, self.ospf_intfs)
 
@@ -351,44 +369,38 @@ class Controller(Thread):
         self.pkt_cache[ip] = pkt
         self.send(arp_req)
 
-    def ospfLSUCallback(self, interval):
-        threading.Timer(interval, self.ospfLSUCallback, args=[interval]).start()
-        self.lsu_flood()
-
     def ospfHelloCallback(self, interval, interface, idx):
         threading.Timer(interval,self.ospfHelloCallback,args =[interval, interface, idx]).start()
         src_mac = self.macs[idx]
         pkt = interface.build_hello_packet(src_mac)
         self.send(pkt)
 
-    def floodLSUPkt(self):
-        # print('Flooding')
-        lsu_adverts = self.routes.lsa[self.routerID]
-        lsu_packets = [LSU(subnet=adv[0], mask=adv[1], routerID=self.routerID) for adv in lsu_adverts]
-        num_adverts = len(lsu_packets)
-
-        for neighbor in self.routes.adj[self.routerID]:
-            dst_ip = self.routes.id_to_ip[neighbor]
-            src_ip = self.getSrcIp(dst_ip)
-
-            l2 = Ether(dst="ff:ff:ff:ff:ff:ff")
-            l2_metadata = CPUMetadata(origEtherType=0x0800, srcPort=1)
-            l3 = IP(src=src_ip, dst=dst_ip, proto=89)
-            pwospf_lsu = PWOSPF(type=LSU_TYPE, routerID=self.routerID, areaID=self.areaID,
-                                seqNum=self.host_seq, ttl=TTL_DEFAULT, adverts=num_adverts,
-                                advertisements=lsu_packets)
-
-            lsu_packet = l2 / l2_metadata / l3 / pwospf_lsu
-
-            if not self.arp_cache.in_cache(dst_ip):
-                self.sendArpRequest(lsu_packet, dst_ip)
-            else:
-                self.send(lsu_packet)
-
-        self.host_seq += 1
-
-        self.lsu_timer = threading.Timer(3 * self.lsuInt, self.floodLSUPkt)
+    def pwospf_lsu_flood_wrapper(self):
+        self.floodLSUPkt()
+        self.lsu_timer = threading.Timer(3*self.lsuInt,self.pwospf_lsu_flood_wrapper)
         self.lsu_timer.start()
+
+    def floodLSUPkt(self):
+        neighbor_routers = self.routes.adj[self.routerID]
+        lsu_ads = []
+        for rid in self.routes.lsa:
+            for v in self.routes.lsa[rid]:
+                lsu_ads.append((v,rid))
+        print(f"{self.sw}: LSU_AD_SEND --> {lsu_ads}")
+        lsu_ads_pkt = [LSU(subnet = s, mask = m, routerID = r) for (s,m),r in lsu_ads]
+        for n in neighbor_routers:
+            dst_ip = self.routes.id_to_ip[n]
+            src_ip = self.getSrcIp(dst_ip)
+            l2 = Ether(dst ="ff:ff:ff:ff:ff:ff")
+            l2_cpumetadata = CPUMetadata(origEtherType=0x0800, srcPort = 1)
+            l3 = IP(src = src_ip,dst = dst_ip,proto=89)
+            l3_pwospf_flood = PWOSPF(type=LSU_TYPE,routerID = self.routerID, areaID = self.areaID, seqNum = self.host_seq, ttl = TTL_DEFAULT,adverts = len(lsu_ads_pkt), advertisements = lsu_ads_pkt)
+            lsu_pkt = l2 / l2_cpumetadata / l3 / l3_pwospf_flood
+            if not self.arp_cache.in_cache(dst_ip):
+                self.sendArpRequest(lsu_pkt,dst_ip)
+            else:
+                self.send(lsu_pkt)
+        self.host_seq += 1
 
     def getSrcIp(self, dst_ip):
         for i, subnet in enumerate(self.subnets):
@@ -399,17 +411,21 @@ class Controller(Thread):
     def handlePWOSPFLSU(self, pkt):
         if self.routes.update_lsu(pkt):
             self.lsu_timer.cancel()
+            self.lsu_timer = threading.Timer(3*self.lsuInt,self.pwospf_lsu_flood_wrapper)
+            self.lsu_timer.start()
             self.floodLSUPkt()
 
     def handlePWOSPFHello(self, pkt):
         incoming_ip = pkt[IP].src
-        router_id = pkt[PWOSPF].routerID
+        routerID = pkt[PWOSPF].routerID
         for intfs in self.ospf_intfs:
             if ip_address(incoming_ip) in ip_network(intfs.subnet):
-                intfs.update_timer(router_id, incoming_ip)
+                intfs.update_timer(routerID, incoming_ip)
             if intfs.is_lsu_needed():
-                self.routes.find_node(router_id, incoming_ip)
+                self.routes.find_node(routerID, incoming_ip)
                 self.lsu_timer.cancel()
+                self.lsu_timer = threading.Timer(3*self.lsuInt,self.pwospf_lsu_flood_wrapper)
+                self.lsu_timer.start()
                 self.floodLSUPkt()
 
     def handlePWOSPF(self, pkt):
