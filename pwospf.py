@@ -35,9 +35,9 @@ class PWOSPF(Packet):
 
             ConditionalField(ShortField("ttl", None), lambda pkt: pkt.type == LSU_TYPE),
 
-            ConditionalField(XIntField("adverts", None), lambda pkt: pkt.type == LSU_TYPE),
+            ConditionalField(XIntField("num_adverts", None), lambda pkt: pkt.type == LSU_TYPE),
 
-            ConditionalField(PacketListField("advertisements", [], LSU, count_from=lambda pkt: pkt.adverts), lambda pkt: pkt.type == LSU_TYPE)]
+            ConditionalField(PacketListField("adverts", [], LSU, count_from=lambda pkt: pkt.num_adverts), lambda pkt: pkt.type == LSU_TYPE)]
 
 bind_layers(IP, PWOSPF, proto=89)
 bind_layers(PWOSPF,LSU,type=LSU_TYPE)

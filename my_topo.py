@@ -1,3 +1,5 @@
+from mininet.topo import Topo
+
 class SwitchTopo(Topo):
     def __init__(self, **opts):
         Topo.__init__(self, **opts)

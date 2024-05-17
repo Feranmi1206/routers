@@ -59,15 +59,6 @@ cpu3 = Controller(s3, ["33.33.33.1", "44.44.44.3"], ["00:00:00:00:00:30","00:00:
 
 mask = 0xFFFFFFFF
 
-cpu1.routes.routes[("11.11.11.20", mask)] = "11.11.11.20"
-cpu1.routes.routes[("11.11.11.30", mask)] = "11.11.11.30"
-
-cpu2.routes.routes[("22.22.22.20", mask)] = "22.22.22.20"
-cpu2.routes.routes[("22.22.22.30", mask)] = "22.22.22.30"
-
-cpu3.routes.routes[("33.33.33.20", mask)] = "33.33.33.20"
-cpu3.routes.routes[("33.33.33.30", mask)] = "33.33.33.30"
-
 s1.insertTableEntry(
     table_name="MyIngress.routing_table",
     match_fields={"hdr.ipv4.dstAddr": ["11.11.11.20", mask]},
